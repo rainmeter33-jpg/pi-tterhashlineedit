@@ -1,0 +1,7 @@
+node_modules/
+bun.lock
+package-lock.json
+test/__comparison_test__/
+test/__pipeline_test__/
+test/__versus_test__/
+*.tgz
