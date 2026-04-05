@@ -101,33 +101,45 @@ export function detectIndentation(line: string): { type: 'tabs' | 'spaces' | 'mi
 	return { type: 'none', count: 0 };
 }
 
-/** Warn if replacement lines use a different indentation style than the file. */
+/**
+ * Detect the dominant indentation style across the ENTIRE file.
+ * Returns the most common indentation type (tabs, spaces, or none).
+ */
+function detectFileIndentation(fileLines: string[]): { type: 'tabs' | 'spaces' | 'none' } {
+	let tabs = 0, spaces = 0;
+	for (const line of fileLines) {
+		if (line.trim() === '') continue;
+		const ind = detectIndentation(line);
+		if (ind.type === 'tabs') tabs++;
+		else if (ind.type === 'spaces') spaces++;
+		else if (ind.type === 'mixed') tabs++; // mixed counts as tab file
+	}
+	if (tabs >= spaces && tabs > 0) return { type: 'tabs' };
+	if (spaces > tabs) return { type: 'spaces' };
+	return { type: 'none' };
+}
+
+/**
+ * Warn if replacement lines use a different indentation style than the file.
+ * Checks against the ENTIRE file's dominant style, not just the replaced lines.
+ */
 export function validateIndentationConsistency(
 	edits: HashlineEdit[],
 	fileLines: string[],
 ): string[] {
 	const warnings: string[] = [];
+	const fileStyle = detectFileIndentation(fileLines);
 	for (const edit of edits) {
 		if (edit.op !== 'replace') continue;
-		const startIdx = edit.pos.line - 1;
-		const endIdx = edit.end ? edit.end.line : edit.pos.line;
-		const originalLines = fileLines.slice(startIdx, endIdx);
-		let origHasTabs = false, origHasSpaces = false;
-		for (const line of originalLines) {
-			if (line.trim() === '') continue;
-			const ind = detectIndentation(line);
-			if (ind.type === 'tabs' || ind.type === 'mixed') origHasTabs = true;
-			if (ind.type === 'spaces' || ind.type === 'mixed') origHasSpaces = true;
-		}
 		for (let i = 0; i < edit.lines.length; i++) {
 			const newLine = edit.lines[i]!;
 			if (newLine.trim() === '') continue;
 			const newInd = detectIndentation(newLine);
-			if (origHasTabs && !origHasSpaces && newInd.type === 'spaces' && newInd.count > 0) {
-				warnings.push(`Edit line ${i + 1}: spaces in tab-indented file.`);
+			if (fileStyle.type === 'tabs' && newInd.type === 'spaces' && newInd.count > 0) {
+				warnings.push(`Edit line ${i + 1}: uses spaces but file uses tabs.`);
 			}
-			if (origHasSpaces && !origHasTabs && newInd.type === 'tabs' && newInd.count > 0) {
-				warnings.push(`Edit line ${i + 1}: tabs in space-indented file.`);
+			if (fileStyle.type === 'spaces' && newInd.type === 'tabs' && newInd.count > 0) {
+				warnings.push(`Edit line ${i + 1}: uses tabs but file uses spaces.`);
 			}
 		}
 	}
