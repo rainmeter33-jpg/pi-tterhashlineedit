@@ -12,6 +12,12 @@ import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
 import { generateDiffString, normalizeToLF, stripBom } from "./edit-diff";
 import { writeFileAtomically } from "./fs-write";
 import {
+	tryFuzzyRecoverAnchor,
+	type FuzzyRecovery,
+} from "./fuzzy-anchor";
+import { mergeOverlappingEdits } from "./edit-merge";
+import { generateSemanticDiff } from "./semantic-diff";
+import {
 	applyHashlineEdits,
 	computeLineHash,
 	detectIndentation,
@@ -23,7 +29,6 @@ import {
 	validateIndentationConsistency,
 } from "./hashline";
 import { throwIfAborted } from "./runtime";
-
 // ─── Types ──────────────────────────────────────────────────────────────
 
 /** Edit item extended with optional dual context anchors. */
@@ -61,6 +66,12 @@ export interface PipelineResult {
 	writtenContent: string | null;
 	/** Unified diff between original and simulated content. */
 	diff: string | null;
+	/** Semantic diff (whitespace-only changes reported separately). */
+	semanticDiff: string | null;
+	/** Fuzzy anchor recoveries performed during validation. */
+	fuzzyRecoveries: FuzzyRecovery[];
+	/** Edit merges performed (overlapping edits auto-merged). */
+	editMerges: string[];
 	warnings: string[];
 	errors: string[];
 	wrote: boolean;
@@ -81,6 +92,10 @@ export interface PipelineOptions {
 	lineEnding?: "\r\n" | "\n";
 	/** AbortSignal for cancellation. */
 	signal?: AbortSignal;
+	/** Enable fuzzy anchor recovery: search ±N lines when hash fails. Default: 3. Set 0 to disable. */
+	fuzzyRecoveryWindow?: number;
+	/** Enable auto-merge of overlapping edits. Default: true. */
+	autoMergeEdits?: boolean;
 }
 
 interface ResolvedContextAnchor {
@@ -330,6 +345,77 @@ async function verifyWrittenContent(
 	}
 }
 
+/**
+ * Try to resolve edit anchors with fuzzy recovery.
+ * When an anchor hash fails, search nearby lines for a match.
+ */
+function resolveEditAnchorsWithFuzzyRecovery(
+	toolEdits: DualAnchorToolEdit[],
+	fileLines: string[],
+	window: number,
+	recoveries: FuzzyRecovery[],
+): HashlineEdit[] {
+	const result: HashlineEdit[] = [];
+
+	for (const edit of toolEdits) {
+		const lines = (() => {
+			if (Array.isArray(edit.lines)) return edit.lines;
+			if (typeof edit.lines === "string") return edit.lines.replace(/\r/g, "").split("\n");
+			return [];
+		})();
+
+		const op = edit.op;
+
+		if (op === "replace") {
+			if (!edit.pos) throw new Error('Replace requires a "pos" anchor.');
+
+			const parsed = parseLineRef(edit.pos);
+			const recovery = tryFuzzyRecoverAnchor(parsed, fileLines, window);
+
+			if (recovery && recovery.offset !== 0) {
+				recoveries.push(recovery);
+				result.push({
+					op: "replace",
+					pos: recovery.anchor,
+					...(edit.end ? { end: (() => {
+						const endParsed = parseLineRef(edit.end);
+						const endRecovery = tryFuzzyRecoverAnchor(endParsed, fileLines, window);
+						if (endRecovery) {
+							if (endRecovery.offset !== 0) recoveries.push(endRecovery);
+							return endRecovery.anchor;
+						}
+						return endParsed;
+					})() } : {}),
+					lines,
+				});
+			} else {
+				// No recovery needed — hash already matches or not found
+				result.push({
+					op: "replace",
+					pos: parsed,
+					...(edit.end ? { end: parseLineRef(edit.end) } : {}),
+					lines,
+				});
+			}
+		} else if (op === "append") {
+			result.push({
+				op: "append",
+				...(edit.pos ? { pos: parseLineRef(edit.pos) } : {}),
+				lines,
+			});
+		} else if (op === "prepend") {
+			result.push({
+				op: "prepend",
+				...(edit.pos ? { pos: parseLineRef(edit.pos) } : {}),
+				lines,
+			});
+		}
+	}
+
+	return result;
+}
+
+
 // ─── Main pipeline ──────────────────────────────────────────────────────
 
 /**
@@ -358,6 +444,8 @@ export async function executeEditPipeline(
 		bom = "",
 		lineEnding = "\n",
 		signal,
+		fuzzyRecoveryWindow = 3,
+		autoMergeEdits = true,
 	} = options;
 
 	const stages: StageResult[] = [];
@@ -366,10 +454,12 @@ export async function executeEditPipeline(
 	let simulatedContent: string | null = null;
 	let writtenContent: string | null = null;
 	let diff: string | null = null;
+	let semanticDiffResult: string | null = null;
+	const fuzzyRecoveries: FuzzyRecovery[] = [];
+	const editMerges: string[] = [];
 	let wrote = false;
 	let verified = false;
 	let firstChangedLine: number | undefined;
-
 	// ── Stage 1: READ ──────────────────────────────────────────────────
 	const readStage = stage("read", () => {
 		throwIfAborted(signal);
@@ -393,7 +483,26 @@ export async function executeEditPipeline(
 		try {
 			resolvedEdits = resolveEditAnchors(toolEdits);
 		} catch (e) {
-			return fail(`Anchor parsing failed: ${(e as Error).message}`);
+			// Try fuzzy recovery on pos/end anchors before giving up
+			if (fuzzyRecoveryWindow > 0) {
+				try {
+					resolvedEdits = resolveEditAnchorsWithFuzzyRecovery(toolEdits, fileLines, fuzzyRecoveryWindow, fuzzyRecoveries);
+				} catch {
+					return fail(`Anchor parsing failed: ${(e as Error).message}`);
+				}
+			} else {
+				return fail(`Anchor parsing failed: ${(e as Error).message}`);
+			}
+		}
+
+		// Auto-merge overlapping edits if enabled
+		if (autoMergeEdits && resolvedEdits.length > 1) {
+			const mergeResult = mergeOverlappingEdits(resolvedEdits);
+			if (mergeResult.warnings.length > 0) {
+				editMerges.push(...mergeResult.warnings);
+				warnings.push(...mergeResult.warnings);
+				resolvedEdits = mergeResult.edits;
+			}
 		}
 
 		// Parse context anchors (anchor1, anchor2)
@@ -416,9 +525,11 @@ export async function executeEditPipeline(
 				0,
 			) + ctxAnchors.length;
 
+		const mergeNote = editMerges.length > 0 ? `, ${editMerges.length} merge(s)` : "";
+		const fuzzyNote = fuzzyRecoveries.length > 0 ? `, ${fuzzyRecoveries.length} fuzzy recoveries` : "";
 		return ok(
 			`Resolved ${totalAnchors} anchors ` +
-				`(${resolvedEdits.length} edits, ${ctxAnchors.length} context).`,
+				`(${resolvedEdits.length} edits, ${ctxAnchors.length} context${mergeNote}${fuzzyNote}).`,
 		);
 	});
 	stages.push(anchorStage);
@@ -487,9 +598,18 @@ export async function executeEditPipeline(
 				warnings.push(...result.warnings);
 			}
 
-			// Generate diff
+			// Generate diff (standard + semantic)
 			const diffResult = generateDiffString(content, result.content);
 			diff = diffResult.diff;
+
+			// Generate semantic diff (ignores whitespace-only changes)
+			const semDiff = generateSemanticDiff(content, result.content);
+			semanticDiffResult = semDiff.semanticDiff;
+			if (semDiff.isWhitespaceOnly) {
+				warnings.push(
+					`Semantic diff: only whitespace changes detected (${semDiff.whitespaceOnlyChanges} lines). No content changed.`,
+				);
+			}
 
 			if (content === result.content) {
 				return fail(
@@ -640,6 +760,9 @@ export async function executeEditPipeline(
 			simulatedContent,
 			writtenContent,
 			diff,
+			semanticDiff: semanticDiffResult,
+			fuzzyRecoveries,
+			editMerges,
 			warnings,
 			errors,
 			wrote,
