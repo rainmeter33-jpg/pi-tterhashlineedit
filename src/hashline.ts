@@ -146,6 +146,134 @@ export function validateIndentationConsistency(
 	return warnings;
 }
 
+// ─── Post-edit integrity checks ────────────────────────────────────────
+
+/**
+ * PROTECTION 1: Duplicate adjacent line detection.
+ *
+ * After an edit, scan ±5 lines around each edit zone for consecutive
+ * identical lines. If line[i] === line[i+1] and neither was explicitly
+ * part of the replacement → REJECT (likely a corruption from partial replace).
+ */
+export function detectDuplicateAdjacentLines(
+	originalLines: string[],
+	resultLines: string[],
+	editZones: Array<{ startLine: number; endLine: number }>,
+	window: number = 5,
+): string[] {
+	const warnings: string[] = [];
+	const editZoneSet = new Set<number>();
+
+	// Mark all lines that were explicitly part of an edit
+	for (const zone of editZones) {
+		for (let line = zone.startLine; line <= zone.endLine; line++) {
+			editZoneSet.add(line);
+		}
+	}
+
+	for (const zone of editZones) {
+		const scanStart = Math.max(1, zone.startLine - window);
+		const scanEnd = Math.min(resultLines.length, zone.endLine + window);
+
+		for (let i = scanStart; i < scanEnd; i++) {
+			const curr = resultLines[i - 1];
+			const next = resultLines[i]; // i is 1-based, next is i+1 (1-based)
+			if (next === undefined) continue;
+
+			// Skip if both lines were part of the explicit edit
+			if (editZoneSet.has(i) && editZoneSet.has(i + 1)) continue;
+
+			// Check for duplicate adjacent lines
+			const currTrimmed = curr.trimEnd();
+			const nextTrimmed = next.trimEnd();
+			if (currTrimmed.length > 0 && currTrimmed === nextTrimmed) {
+				warnings.push(
+					`Duplicate adjacent lines detected at line ${i}: ` +
+					`"${currTrimmed.slice(0, 60)}${currTrimmed.length > 60 ? '...' : ''}" appears consecutively. ` +
+					`This likely indicates a corrupted edit.`,
+				);
+			}
+		}
+	}
+
+	return warnings;
+}
+
+/**
+ * PROTECTION 3: Hash overlap guard.
+ *
+ * After an edit, re-hash the lines JUST OUTSIDE the edit zone (before start
+ * and after end). If those adjacent lines changed hash compared to the original,
+ * the edit corrupted surrounding context.
+ *
+ * Returns an array of error messages (empty = no corruption detected).
+ */
+export function detectContextHashDrift(
+	originalLines: string[],
+	resultLines: string[],
+	editZones: Array<{ startLine: number; endLine: number }>,
+	contextRadius: number = 2,
+): string[] {
+	const errors: string[] = [];
+
+	// Build a set of all lines that are within ANY edit zone
+	const modifiedLines = new Set<number>();
+	for (const zone of editZones) {
+		for (let line = zone.startLine; line <= zone.endLine; line++) {
+			modifiedLines.add(line);
+		}
+	}
+
+	for (const zone of editZones) {
+		// Check lines BEFORE the edit zone (skip if that line is in another edit zone)
+		for (let offset = 1; offset <= contextRadius; offset++) {
+			const origLineNum = zone.startLine - offset;
+			if (origLineNum < 1) continue;
+			// Skip if this context line is itself part of an edit zone (it's been intentionally modified)
+			if (modifiedLines.has(origLineNum)) continue;
+
+			const origHash = computeLineHash(origLineNum, originalLines[origLineNum - 1]!);
+			const resultLineNum = origLineNum; // lines before zone are unchanged in position
+			if (resultLineNum < 1 || resultLineNum > resultLines.length) continue;
+
+			const resultHash = computeLineHash(resultLineNum, resultLines[resultLineNum - 1]!);
+			if (origHash !== resultHash) {
+				errors.push(
+					`Context hash drift above edit zone (line ${origLineNum}): ` +
+					`expected hash ${origHash}, got ${resultHash}. ` +
+					`The edit may have corrupted surrounding context.`,
+				);
+			}
+		}
+
+		// Check lines AFTER the edit zone (skip if that line is in another edit zone)
+		const lineDelta = resultLines.length - originalLines.length;
+		for (let offset = 1; offset <= contextRadius; offset++) {
+			const origLineNum = zone.endLine + offset;
+			if (origLineNum > originalLines.length) continue;
+			// Skip if this context line is itself part of an edit zone
+			if (modifiedLines.has(origLineNum)) continue;
+
+			// The line after the edit zone may have shifted
+			const resultLineNum = origLineNum + lineDelta;
+			if (resultLineNum < 1 || resultLineNum > resultLines.length) continue;
+
+			const origContent = originalLines[origLineNum - 1]!.trimEnd();
+			const resultContent = resultLines[resultLineNum - 1]!.trimEnd();
+
+			if (origContent !== resultContent && origContent.length > 0) {
+				errors.push(
+					`Context content drift below edit zone (original line ${origLineNum}): ` +
+					`expected "${origContent.slice(0, 50)}...", ` +
+					`got "${resultContent.slice(0, 50)}...". ` +
+					`The edit may have corrupted surrounding context.`,
+				);
+			}
+		}
+	}
+
+	return errors;
+}
 // ─── Parsing ────────────────────────────────────────────────────────────
 
 function diagnoseLineRef(ref: string): string {

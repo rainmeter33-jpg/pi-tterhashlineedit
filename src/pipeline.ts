@@ -20,6 +20,8 @@ import { generateSemanticDiff } from "./semantic-diff";
 import {
 	applyHashlineEdits,
 	computeLineHash,
+	detectDuplicateAdjacentLines,
+	detectContextHashDrift,
 	detectIndentation,
 	parseLineRef,
 	resolveEditAnchors,
@@ -29,7 +31,8 @@ import {
 	validateIndentationConsistency,
 } from "./hashline";
 import { throwIfAborted } from "./runtime";
-// ─── Types ──────────────────────────────────────────────────────────────
+
+// ─── Types ─────────────────────────────────────────────────────────────
 
 /** Edit item extended with optional dual context anchors. */
 export interface DualAnchorToolEdit extends HashlineToolEdit {
@@ -187,17 +190,11 @@ function computeEditZones(edits: HashlineEdit[]): EditZone[] {
 				break;
 			}
 			case "append": {
-				if (edit.pos) {
-					// Append inserts AFTER pos.line — pos itself is not modified
-					// No zone to mark
-				}
+				// Append inserts AFTER pos.line — pos itself is not modified
 				break;
 			}
 			case "prepend": {
-				if (edit.pos) {
-					// Prepend inserts BEFORE pos.line — pos itself is not modified
-					// No zone to mark
-				}
+				// Prepend inserts BEFORE pos.line — pos itself is not modified
 				break;
 			}
 		}
@@ -415,8 +412,7 @@ function resolveEditAnchorsWithFuzzyRecovery(
 	return result;
 }
 
-
-// ─── Main pipeline ──────────────────────────────────────────────────────
+// ─── Main pipeline ─────────────────────────────────────────────────────
 
 /**
  * Execute the 7-stage hashline edit pipeline.
@@ -460,6 +456,7 @@ export async function executeEditPipeline(
 	let wrote = false;
 	let verified = false;
 	let firstChangedLine: number | undefined;
+
 	// ── Stage 1: READ ──────────────────────────────────────────────────
 	const readStage = stage("read", () => {
 		throwIfAborted(signal);
@@ -543,12 +540,8 @@ export async function executeEditPipeline(
 		throwIfAborted(signal);
 
 		// Validate main anchors via applyHashlineEdits (dry validation)
-		// We call applyHashlineEdits which validates all pos/end anchors
-		// but catch the error to report it as a validation stage failure.
 		try {
-			// This validates hashes internally before applying
 			const dryResult = applyHashlineEdits(content, resolvedEdits!, signal);
-			// Collect any warnings from the dry run
 			if (dryResult.warnings) {
 				warnings.push(...dryResult.warnings);
 			}
@@ -598,7 +591,7 @@ export async function executeEditPipeline(
 				warnings.push(...result.warnings);
 			}
 
-			// Generate diff (standard + semantic)
+			// Generate standard diff
 			const diffResult = generateDiffString(content, result.content);
 			diff = diffResult.diff;
 
@@ -611,17 +604,38 @@ export async function executeEditPipeline(
 				);
 			}
 
+			// ── PROTECTION 1: Duplicate adjacent line detection ──
+			const simLines = result.content.split("\n");
+			const editZones = computeEditZones(resolvedEdits!);
+			const dupWarnings = detectDuplicateAdjacentLines(
+				fileLines, simLines, editZones,
+			);
+			if (dupWarnings.length > 0) {
+				warnings.push(...dupWarnings);
+			}
+
+			// ── PROTECTION 3: Context hash drift guard ──
+			const hashDriftErrors = detectContextHashDrift(
+				fileLines, simLines, editZones,
+			);
+			if (hashDriftErrors.length > 0) {
+				return fail(
+					`Context integrity check failed: ${hashDriftErrors.join("; ")}`,
+				);
+			}
+
 			if (content === result.content) {
 				return fail(
 					"Simulation produced identical content — no changes would be made.",
 				);
 			}
 
-			const simLines = result.content.split("\n").length;
-			const origLines = content.split("\n").length;
+			const simLineCount = result.content.split("\n").length;
+			const origLineCount = content.split("\n").length;
+			const dupNote = dupWarnings.length > 0 ? `, ${dupWarnings.length} duplicate(s)` : "";
 			return ok(
-				`Simulated: ${origLines} → ${simLines} lines, ` +
-					`first change at line ${result.firstChangedLine ?? "?"}.`,
+				`Simulated: ${origLineCount} → ${simLineCount} lines, ` +
+					`first change at line ${result.firstChangedLine ?? "?"}${dupNote}.`,
 			);
 		} catch (e) {
 			return fail(`Simulation failed: ${(e as Error).message}`);
@@ -676,7 +690,6 @@ export async function executeEditPipeline(
 		return buildResult(false);
 	}
 
-	// stage() is sync but writeStage needs async — handle specially
 	const writeStart = performance.now();
 	try {
 		throwIfAborted(signal);
