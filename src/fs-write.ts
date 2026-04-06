@@ -31,7 +31,7 @@ async function resolveAtomicWritePath(path: string): Promise<string> {
 
 export async function writeFileAtomically(
   path: string,
-  content: string,
+  content: string | Uint8Array,
 ): Promise<void> {
   const targetPath = await resolveAtomicWritePath(path);
 
@@ -45,14 +45,14 @@ export async function writeFileAtomically(
   }
 
   if (existingStats && existingStats.nlink > 1) {
-    await writeFile(targetPath, content, "utf-8");
+    await writeFile(targetPath, content);
     return;
   }
 
   const dir = dirname(targetPath);
   const tempPath = join(dir, `.tmp-${randomUUID()}`);
   await mkdir(dir, { recursive: true });
-  await writeFile(tempPath, content, "utf-8");
+  await writeFile(tempPath, content);
 
   if (existingStats) {
     await chmod(tempPath, existingStats.mode & 0o7777);

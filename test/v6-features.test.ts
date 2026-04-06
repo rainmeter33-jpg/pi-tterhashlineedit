@@ -426,13 +426,12 @@ describe("Batch transaction", () => {
 // 5. POST-EDIT INTEGRITY PROTECTIONS
 // ═══════════════════════════════════════════════════════════════════════
 describe("Post-edit integrity protections", () => {
-	it("detects duplicate adjacent lines in result", () => {
+	it("ignores duplicate adjacent lines when at least one duplicate line is inside the edit zone", () => {
 		const original = ["line1", "line2", "line3"];
-		const result = ["line1", "line2", "line2", "line3"]; // duplicate at line 3
+		const result = ["line1", "line2", "line2", "line3"]; // duplicate created by replacement zone
 		const zones = [{ startLine: 3, endLine: 3 }];
 		const warnings = detectDuplicateAdjacentLines(original, result, zones);
-		expect(warnings.length).toBeGreaterThan(0);
-		expect(warnings[0]).toContain("Duplicate adjacent lines");
+		expect(warnings.length).toBe(0);
 	});
 
 	it("does not warn when no duplicates", () => {

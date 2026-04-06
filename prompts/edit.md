@@ -8,7 +8,7 @@ Use `read` first if you do not have current `LINE#HASH` references for the targe
 
 <payload>
 ```
-{ path, edits: [{ op, pos, end, lines, anchor1, anchor2 }] }
+{ path, edits: [{ op, pos, end, lines, anchor1, anchor2, expectedStartByte, expectedEndByte, expectedBytesBase64, expectedHash, replacementBytesBase64 }], strict, expectedFileHash }
 ```
 
 - `path` — target file path.
@@ -45,6 +45,27 @@ When dual anchors are provided, the edit runs through a 7-stage pipeline:
 7. **verify**: re-read the file and confirm it matches the simulation byte-for-byte.
 
 If any stage fails, the edit is rejected with a clear diagnostic.
+
+<strict-mode>
+For maximum local safety, enable strict mode:
+- top-level `strict: true`
+- optional top-level `expectedFileHash: "sha256:..."` to reject any concurrent whole-file change
+- per-edit optional `expectedStartByte` / `expectedEndByte`
+- per-edit optional `expectedBytesBase64` for exact byte match on the targeted range
+- per-edit optional `expectedHash` for sha256 verification of the targeted range
+- per-edit optional `replacementBytesBase64` to replace using exact bytes instead of text reconstruction
+
+Strict mode performs:
+1. raw byte re-read
+2. anchor verification
+3. exact byte-range verification
+4. sha256 verification
+5. byte-splice replacement
+6. atomic write
+7. post-write byte-for-byte verification
+
+If any byte-level check fails, the edit is rejected instead of guessing.
+</strict-mode>
 </dual-anchors>
 
 <examples>

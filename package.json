@@ -42,5 +42,10 @@
     "@types/xxhashjs": "^0.2.4",
     "typescript": "^6.0.2",
     "vitest": "^4.1.2"
+  },
+  "scripts": {
+    "check": "tsc -p . --noEmit",
+    "build": "tsc -p . --noEmit",
+    "test": "bun test"
   }
 }

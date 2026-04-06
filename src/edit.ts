@@ -1,5 +1,6 @@
+import { applyStrictEditRequest, type StrictEditItem } from "./strict-bytes";
 import type { EditToolDetails, ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type, type Static } from "@sinclair/typebox";
 import { constants } from "fs";
 import { readFileSync } from "fs";
 import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
@@ -48,6 +49,11 @@ const replaceEditItemSchema = Type.Object(
 		lines: hashlineEditLinesSchema,
 		anchor1: anchorField,
 		anchor2: anchorField,
+		expectedStartByte: Type.Optional(Type.Integer()),
+		expectedEndByte: Type.Optional(Type.Integer()),
+		expectedBytesBase64: Type.Optional(Type.String()),
+		expectedHash: Type.Optional(Type.String({ description: "sha256:<hex> or raw hex" })),
+		replacementBytesBase64: Type.Optional(Type.String()),
 	},
 	{ additionalProperties: false },
 );
@@ -59,6 +65,11 @@ const appendEditItemSchema = Type.Object(
 		lines: hashlineEditLinesSchema,
 		anchor1: anchorField,
 		anchor2: anchorField,
+		expectedStartByte: Type.Optional(Type.Integer()),
+		expectedEndByte: Type.Optional(Type.Integer()),
+		expectedBytesBase64: Type.Optional(Type.String()),
+		expectedHash: Type.Optional(Type.String({ description: "sha256:<hex> or raw hex" })),
+		replacementBytesBase64: Type.Optional(Type.String()),
 	},
 	{ additionalProperties: false },
 );
@@ -70,6 +81,11 @@ const prependEditItemSchema = Type.Object(
 		lines: hashlineEditLinesSchema,
 		anchor1: anchorField,
 		anchor2: anchorField,
+		expectedStartByte: Type.Optional(Type.Integer()),
+		expectedEndByte: Type.Optional(Type.Integer()),
+		expectedBytesBase64: Type.Optional(Type.String()),
+		expectedHash: Type.Optional(Type.String({ description: "sha256:<hex> or raw hex" })),
+		replacementBytesBase64: Type.Optional(Type.String()),
 	},
 	{ additionalProperties: false },
 );
@@ -86,6 +102,8 @@ export const hashlineEditToolSchema = Type.Object(
 		edits: Type.Optional(
 			Type.Array(hashlineEditItemSchema, { description: "edits over $path" }),
 		),
+		strict: Type.Optional(Type.Boolean({ description: "Enable strict byte-verified editing" })),
+		expectedFileHash: Type.Optional(Type.String({ description: "sha256:<hex> or raw hex for whole-file verification" })),
 		oldText: Type.Optional(Type.String()),
 		newText: Type.Optional(Type.String()),
 		old_text: Type.Optional(Type.String()),
@@ -94,9 +112,13 @@ export const hashlineEditToolSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
+type EditRequest = Static<typeof hashlineEditToolSchema>;
+
 type EditRequestParams = {
 	path: string;
-	edits?: DualAnchorToolEdit[];
+	edits?: (DualAnchorToolEdit & StrictEditItem)[];
+	strict?: boolean;
+	expectedFileHash?: string;
 	oldText?: string;
 	newText?: string;
 	old_text?: string;
@@ -114,8 +136,11 @@ const EDIT_DESC = readFileSync(
 	"utf-8",
 ).trim();
 
-const ROOT_KEYS = new Set(["path", "edits", "oldText", "newText", "old_text", "new_text"]);
-const ITEM_KEYS = new Set(["op", "pos", "end", "lines", "anchor1", "anchor2"]);
+const ROOT_KEYS = new Set(["path", "edits", "strict", "expectedFileHash", "oldText", "newText", "old_text", "new_text"]);
+const ITEM_KEYS = new Set([
+  "op", "pos", "end", "lines", "anchor1", "anchor2",
+  "expectedStartByte", "expectedEndByte", "expectedBytesBase64", "expectedHash", "replacementBytesBase64",
+]);
 const LEGACY_KEYS = ["oldText", "newText", "old_text", "new_text"] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -249,6 +274,17 @@ export function assertEditRequest(request: unknown): asserts request is EditRequ
 	}
 }
 
+function usesStrictMode(params: EditRequestParams): boolean {
+	return params.strict === true || !!params.expectedFileHash || (params.edits?.some(
+		(edit) =>
+			edit.expectedStartByte !== undefined ||
+			edit.expectedEndByte !== undefined ||
+			edit.expectedBytesBase64 !== undefined ||
+			edit.expectedHash !== undefined ||
+			edit.replacementBytesBase64 !== undefined,
+	) ?? false);
+}
+
 // ─── Check if any edit uses dual anchors ─────────────────────────────────
 
 function usesDualAnchors(edits: DualAnchorToolEdit[]): boolean {
@@ -268,13 +304,14 @@ export function registerEditTool(pi: ExtensionAPI): void {
 		description: EDIT_DESC,
 		parameters: hashlineEditToolSchema,
 
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, rawParams, signal, _onUpdate, ctx) {
+			const params = rawParams as EditRequest;
 			assertEditRequest(params);
 
 			const path = params.path;
 			const absolutePath = resolveToCwd(path, ctx.cwd);
 			const toolEdits = Array.isArray(params.edits)
-				? (params.edits as DualAnchorToolEdit[])
+				? (params.edits as (DualAnchorToolEdit & StrictEditItem)[])
 				: [];
 			const legacy = extractLegacyTopLevelReplace(params as Record<string, unknown>);
 
@@ -329,6 +366,39 @@ export function registerEditTool(pi: ExtensionAPI): void {
 			let firstChangedLine: number | undefined;
 			let compatibilityDetails: CompatibilityDetails | undefined;
 
+			if (toolEdits.length > 0 && usesStrictMode(params)) {
+				const strictResult = await applyStrictEditRequest(
+					absolutePath,
+					originalNormalized,
+					toolEdits,
+					{
+						expectedFileHash: params.expectedFileHash,
+						verifyAfterWrite: true,
+						signal,
+					},
+				);
+
+				result = normalizeToLF(stripBom(strictResult.content).text);
+				firstChangedLine = strictResult.firstChangedLine;
+
+				const diffResult = generateDiffString(originalNormalized, result);
+				const preview = buildCompactHashlineDiffPreview(diffResult.diff);
+				const summaryLine = `Changes: +${preview.addedLines} -${preview.removedLines}`;
+				const previewBlock = preview.preview ? `\n\nDiff preview:\n${preview.preview}` : "";
+
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Updated ${path} (strict)\n${summaryLine}${previewBlock}\n\nStrict verification: byte-range checks + atomic write + post-write verification passed.`,
+						},
+					],
+					details: {
+						diff: diffResult.diff,
+						firstChangedLine: firstChangedLine ?? diffResult.firstChangedLine,
+					} as EditToolDetails,
+				};
+			}
 			if (toolEdits.length > 0 && usesDualAnchors(toolEdits)) {
 				// ── Pipeline mode (dual anchors) ──────────────────────
 				const pipelineResult = await executeEditPipeline(

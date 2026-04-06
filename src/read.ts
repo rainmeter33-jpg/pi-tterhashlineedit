@@ -1,3 +1,4 @@
+import { formatLosslessReadPreview } from "./strict-bytes";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
   createReadTool,
@@ -7,7 +8,7 @@ import {
   truncateHead,
   type TruncationResult,
 } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type, type Static } from "@sinclair/typebox";
 import { readFileSync } from "fs";
 import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
 import { constants } from "fs";
@@ -95,31 +96,41 @@ export function formatHashlineReadPreview(
     truncation: truncation.truncated ? truncation : undefined,
   };
 }
+const readToolSchema = Type.Object({
+  path: Type.String({
+    description: "Path to the file to read (relative or absolute)",
+  }),
+  offset: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      description: "Line number to start reading from (1-indexed)",
+    }),
+  ),
+  limit: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      description: "Maximum number of lines to read",
+    }),
+  ),
+  mode: Type.Optional(
+    Type.Union([
+      Type.Literal("text"),
+      Type.Literal("lossless"),
+    ], { description: "Read mode: text (default) or lossless byte-accurate preview" }),
+  ),
+});
+
+type ReadParams = Static<typeof readToolSchema>;
 
 export function registerReadTool(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "read",
     label: "Read",
     description: READ_DESC,
-    parameters: Type.Object({
-      path: Type.String({
-        description: "Path to the file to read (relative or absolute)",
-      }),
-      offset: Type.Optional(
-        Type.Integer({
-          minimum: 1,
-          description: "Line number to start reading from (1-indexed)",
-        }),
-      ),
-      limit: Type.Optional(
-        Type.Integer({
-          minimum: 1,
-          description: "Maximum number of lines to read",
-        }),
-      ),
-    }),
+    parameters: readToolSchema,
 
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+    async execute(_toolCallId, rawParams, signal, _onUpdate, ctx) {
+      const params = rawParams as ReadParams;
       const rawPath = params.path;
       const absolutePath = resolveToCwd(rawPath, ctx.cwd);
 
@@ -173,9 +184,22 @@ export function registerReadTool(pi: ExtensionAPI): void {
       }
 
       throwIfAborted(signal);
-      const raw = (await fsReadFile(absolutePath)).toString("utf-8");
+      const rawBytes = await fsReadFile(absolutePath);
       throwIfAborted(signal);
 
+      const mode = params.mode ?? "text";
+      if (mode === "lossless") {
+        const previewText = formatLosslessReadPreview(rawBytes, {
+          offset: params.offset,
+          limit: params.limit,
+        });
+        return {
+          content: [{ type: "text", text: previewText }],
+          details: {},
+        };
+      }
+
+      const raw = rawBytes.toString("utf-8");
       const normalized = normalizeToLF(stripBom(raw).text);
       const preview = formatHashlineReadPreview(normalized, {
         offset: params.offset,

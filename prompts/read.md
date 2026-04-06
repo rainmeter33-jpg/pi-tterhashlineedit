@@ -12,3 +12,9 @@ Supported parameters:
 Default limit: {{DEFAULT_MAX_LINES}} lines or {{DEFAULT_MAX_BYTES}}.
 
 When the first selected line exceeds the byte budget, the tool returns an advisory instead of a partial line, because partial lines produce unusable hash anchors.
+
+Optional mode:
+- `mode: "text"` — default hashline view.
+- `mode: "lossless"` — byte-accurate view showing start/end byte offsets, exact line length, EOL style, base64 bytes, escaped preview text, and whole-file sha256.
+
+Use `mode: "lossless"` when whitespace, CRLF/LF, tabs, Unicode, or invisible characters must be verified exactly.

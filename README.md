@@ -142,6 +142,60 @@ pi-tterhaslinedit (v0.5.0)
 
 ---
 
+## Mode strict byte-level (niveau 3)
+
+Le fork supporte maintenant un mode **strict local** pour des edits lossless et vérifiés en bytes.
+
+### Read lossless
+
+```ts
+read({ path: "src/file.ts", mode: "lossless" })
+```
+
+Retourne pour chaque ligne :
+- `LINE#HASH`
+- `start` / `end` byte offsets
+- `len`
+- `eol` (`lf`, `crlf`, `none`)
+- `b64` = bytes exacts de la ligne
+- `preview` échappé
+- hash `sha256` du fichier entier
+
+### Edit strict
+
+```ts
+edit({
+  path: "src/file.ts",
+  strict: true,
+  expectedFileHash: "sha256:...",
+  edits: [
+    {
+      op: "replace",
+      pos: "12#KJ",
+      end: "14#VR",
+      lines: ["merged"],
+      expectedStartByte: 183,
+      expectedEndByte: 244,
+      expectedBytesBase64: "...",
+      expectedHash: "sha256:..."
+    }
+  ]
+})
+```
+
+Le mode strict fait :
+1. relecture brute du fichier
+2. vérification des anchors
+3. vérification exacte de la plage binaire
+4. vérification sha256
+5. remplacement par byte splice
+6. écriture atomique
+7. vérification post-write byte-for-byte
+
+Si une seule vérification échoue, l'edit est rejeté.
+
+---
+
 ## License
 
 MIT © Wellynounet
